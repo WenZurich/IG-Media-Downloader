@@ -27,6 +27,7 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+          cache-dependency-path: 'requirements-build.txt'
 
       - name: Install dependencies
         shell: pwsh
@@ -114,6 +115,7 @@ jobs:
       - name: Build portable folder
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force -Path portable_spec | Out-Null
           python -m PyInstaller `
             --noconfirm `
             --clean `
