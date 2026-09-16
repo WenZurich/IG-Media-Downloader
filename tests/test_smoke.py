@@ -29,16 +29,31 @@ class CoreSmokeTests(unittest.TestCase):
         )
 
     def test_media_detection(self):
-        self.assertTrue(app.is_cdn("https://scontent-test.cdninstagram.com/file.jpg"))
+        self.assertTrue(
+            app.is_media_url("https://scontent-test.cdninstagram.com/file.jpg")
+        )
+        self.assertTrue(
+            app.is_media_url("https://s11.imginn.com/path/file.jpg?x=1")
+        )
         self.assertEqual(app.ext_for("image/jpeg", "https://x.invalid/a"), ".jpg")
         self.assertEqual(app.ext_for("video/mp4", "https://x.invalid/a"), ".mp4")
         self.assertEqual(app.kind_for("image/jpeg", "https://x.invalid/a"), "image")
         self.assertEqual(app.kind_for("video/mp4", "https://x.invalid/a"), "video")
 
+    def test_target_closed_detection(self):
+        self.assertTrue(
+            app.is_target_closed_error(
+                RuntimeError("Target page, context or browser has been closed")
+            )
+        )
+        self.assertFalse(
+            app.is_target_closed_error(RuntimeError("HTTP 403 Forbidden"))
+        )
+
     def test_cache_writer(self):
         with tempfile.TemporaryDirectory() as td:
             path, kind = app.save_response_bytes(
-                b"test-image-bytes",
+                b"x" * 128,
                 "image/jpeg",
                 "https://scontent-test.cdninstagram.com/a.jpg",
                 Path(td),
@@ -46,7 +61,7 @@ class CoreSmokeTests(unittest.TestCase):
             )
             self.assertEqual(kind, "image")
             self.assertTrue(path.exists())
-            self.assertEqual(path.read_bytes(), b"test-image-bytes")
+            self.assertEqual(path.read_bytes(), b"x" * 128)
 
 
 if __name__ == "__main__":
