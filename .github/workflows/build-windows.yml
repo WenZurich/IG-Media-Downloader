@@ -39,10 +39,10 @@ jobs:
           python -m pip install --upgrade --force-reinstall -r requirements-build.txt
           python -m pip check
 
-      - name: Install bundled Chromium
+      - name: Install bundled Chromium headless shell
         shell: pwsh
         run: |
-          python -m playwright install chromium
+          python -m playwright install --only-shell chromium
           python -c "from pathlib import Path; import playwright; p=Path(playwright.__file__).resolve().parent/'driver'/'package'/'.local-browsers'; print('Bundled browser path:', p); print('Exists:', p.exists()); assert p.exists()"
 
       - name: Syntax check
