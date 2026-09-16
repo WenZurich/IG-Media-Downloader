@@ -18,6 +18,9 @@ jobs:
     name: Test and build Windows x64
     runs-on: windows-latest
 
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: '0'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,11 +39,22 @@ jobs:
           python -m pip install --upgrade --force-reinstall -r requirements-build.txt
           python -m pip check
 
+      - name: Install bundled Chromium
+        shell: pwsh
+        run: |
+          python -m playwright install chromium
+          python -c "from pathlib import Path; import playwright; p=Path(playwright.__file__).resolve().parent/'driver'/'package'/'.local-browsers'; print('Bundled browser path:', p); print('Exists:', p.exists()); assert p.exists()"
+
       - name: Syntax check
         run: python -m py_compile app.py
 
       - name: Core regression tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Browser launch smoke test
+        shell: pwsh
+        run: |
+          python -c "import app; app.playwright_self_test(); print('Playwright browser self-test OK')"
 
       - name: Create Windows icon
         shell: pwsh
@@ -63,8 +77,8 @@ jobs:
           @'
           VSVersionInfo(
             ffi=FixedFileInfo(
-              filevers=(1,4,0,0),
-              prodvers=(1,4,0,0),
+              filevers=(1,5,0,0),
+              prodvers=(1,5,0,0),
               mask=0x3f,
               flags=0x0,
               OS=0x40004,
@@ -79,11 +93,11 @@ jobs:
                   [
                     StringStruct(u'CompanyName', u'WenZurich'),
                     StringStruct(u'FileDescription', u'IG Media Downloader'),
-                    StringStruct(u'FileVersion', u'1.4.0'),
+                    StringStruct(u'FileVersion', u'1.5.0'),
                     StringStruct(u'InternalName', u'IG Media Downloader'),
                     StringStruct(u'OriginalFilename', u'IG-Media-Downloader.exe'),
                     StringStruct(u'ProductName', u'IG Media Downloader'),
-                    StringStruct(u'ProductVersion', u'1.4.0')
+                    StringStruct(u'ProductVersion', u'1.5.0')
                   ]
                 )
               ]),
@@ -134,6 +148,12 @@ jobs:
             app.py
           Compress-Archive -Path 'dist_portable\IG-Media-Downloader\*' -DestinationPath 'IG-Media-Downloader-Portable.zip' -Force
 
+      - name: Packaged EXE browser self-test
+        shell: pwsh
+        run: |
+          & '.\dist_single\IG-Media-Downloader.exe' --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Packaged browser self-test failed with exit code $LASTEXITCODE" }
+
       - name: Verify outputs and create checksums
         shell: pwsh
         run: |
@@ -164,6 +184,6 @@ jobs:
         run: |
           gh release view latest 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create latest --target "$env:GITHUB_SHA" --title "Latest Tested Windows Build" --notes "Built only after syntax and regression tests pass. Portable ZIP is recommended if security software dislikes self-extracting single-file executables."
+            gh release create latest --target "$env:GITHUB_SHA" --title "Latest Tested Windows Build" --notes "Built only after syntax, regression, browser-launch, and packaged-runtime tests pass. Portable ZIP is recommended if security software dislikes self-extracting single-file executables."
           }
           gh release upload latest 'dist_single\IG-Media-Downloader.exe' 'IG-Media-Downloader-Portable.zip' 'SHA256SUMS.txt' --clobber
