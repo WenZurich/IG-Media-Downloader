@@ -4,44 +4,164 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-  schedule:
-    - cron: "*/5 * * * *"
+    paths:
+      - 'app.py'
+      - 'tests/**'
+      - 'requirements-build.txt'
+      - '.github/workflows/build-windows.yml'
 
 permissions:
   contents: write
 
 jobs:
   build:
+    name: Test and build Windows x64
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+          cache: 'pip'
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install --upgrade --force-reinstall -r requirements-build.txt
+          python -m pip check
 
-      - name: Build EXE
+      - name: Syntax check
+        run: python -m py_compile app.py
+
+      - name: Core regression tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Create Windows icon
+        shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "IG-Media-Downloader" --collect-all gallery_dl --collect-all customtkinter --collect-all playwright app.py
+          @'
+          from PIL import Image, ImageDraw
+          im = Image.new('RGBA', (256, 256), (0, 0, 0, 0))
+          d = ImageDraw.Draw(im)
+          d.rounded_rectangle((12, 12, 244, 244), radius=58, fill=(0, 122, 255, 255))
+          d.rounded_rectangle((55, 55, 201, 201), radius=32, outline='white', width=15)
+          d.ellipse((91, 91, 165, 165), outline='white', width=14)
+          d.ellipse((170, 72, 190, 92), fill='white')
+          im.save('app.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])
+          '@ | Set-Content -Encoding utf8 make_icon.py
+          python make_icon.py
 
-      - name: Upload workflow artifact
+      - name: Create Windows version metadata
+        shell: pwsh
+        run: |
+          @'
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=(1,4,0,0),
+              prodvers=(1,4,0,0),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0,0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  u'040904B0',
+                  [
+                    StringStruct(u'CompanyName', u'WenZurich'),
+                    StringStruct(u'FileDescription', u'IG Media Downloader'),
+                    StringStruct(u'FileVersion', u'1.4.0'),
+                    StringStruct(u'InternalName', u'IG Media Downloader'),
+                    StringStruct(u'OriginalFilename', u'IG-Media-Downloader.exe'),
+                    StringStruct(u'ProductName', u'IG Media Downloader'),
+                    StringStruct(u'ProductVersion', u'1.4.0')
+                  ]
+                )
+              ]),
+              VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+            ]
+          )
+          '@ | Set-Content -Encoding utf8 version_info.txt
+
+      - name: Build single-file EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --noupx `
+            --name "IG-Media-Downloader" `
+            --icon app.ico `
+            --version-file version_info.txt `
+            --distpath dist_single `
+            --workpath build_single `
+            --specpath . `
+            --collect-all gallery_dl `
+            --collect-all customtkinter `
+            --collect-all playwright `
+            app.py
+
+      - name: Build portable folder
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --windowed `
+            --noupx `
+            --name "IG-Media-Downloader" `
+            --icon app.ico `
+            --version-file version_info.txt `
+            --distpath dist_portable `
+            --workpath build_portable `
+            --specpath portable_spec `
+            --collect-all gallery_dl `
+            --collect-all customtkinter `
+            --collect-all playwright `
+            app.py
+          Compress-Archive -Path 'dist_portable\IG-Media-Downloader\*' -DestinationPath 'IG-Media-Downloader-Portable.zip' -Force
+
+      - name: Verify outputs and create checksums
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist_single\IG-Media-Downloader.exe')) { throw 'Single EXE was not produced.' }
+          if (-not (Test-Path 'IG-Media-Downloader-Portable.zip')) { throw 'Portable ZIP was not produced.' }
+          $exeHash = (Get-FileHash 'dist_single\IG-Media-Downloader.exe' -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash 'IG-Media-Downloader-Portable.zip' -Algorithm SHA256).Hash.ToLower()
+          "$exeHash  IG-Media-Downloader.exe" | Set-Content -Encoding ascii SHA256SUMS.txt
+          "$zipHash  IG-Media-Downloader-Portable.zip" | Add-Content -Encoding ascii SHA256SUMS.txt
+          Get-Item 'dist_single\IG-Media-Downloader.exe' | Format-List Name,Length,LastWriteTime
+          Get-Content SHA256SUMS.txt
+
+      - name: Upload tested build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: IG-Media-Downloader-Windows
-          path: dist/IG-Media-Downloader.exe
+          name: IG-Media-Downloader-Windows-tested
+          path: |
+            dist_single/IG-Media-Downloader.exe
+            IG-Media-Downloader-Portable.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Publish stable latest EXE
+      - name: Publish tested latest build
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view latest 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create latest --target "$env:GITHUB_SHA" --title "Latest Windows Build" --notes "Automatically built Windows executable."
+            gh release create latest --target "$env:GITHUB_SHA" --title "Latest Tested Windows Build" --notes "Built only after syntax and regression tests pass. Portable ZIP is recommended if security software dislikes self-extracting single-file executables."
           }
-          gh release upload latest "dist/IG-Media-Downloader.exe" --clobber
+          gh release upload latest 'dist_single\IG-Media-Downloader.exe' 'IG-Media-Downloader-Portable.zip' 'SHA256SUMS.txt' --clobber
