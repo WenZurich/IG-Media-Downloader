@@ -10,8 +10,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
 import customtkinter as ctk
 import requests
@@ -21,7 +24,8 @@ from playwright.sync_api import sync_playwright
 from tkinter import filedialog, messagebox
 
 APP_NAME = "IG Media Downloader"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
+
 IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "avif", "heic"}
 VIDEO_EXTS = {"mp4", "mov", "webm", "m4v", "mkv"}
 BROWSER_UA = (
@@ -31,10 +35,39 @@ BROWSER_UA = (
 )
 
 
-def settings_path() -> Path:
+class VerificationRequired(RuntimeError):
+    pass
+
+
+def app_data_dir() -> Path:
     root = Path(os.environ.get("APPDATA", Path.home())) / "IG-Media-Downloader"
     root.mkdir(parents=True, exist_ok=True)
-    return root / "settings.json"
+    return root
+
+
+def settings_path() -> Path:
+    return app_data_dir() / "settings.json"
+
+
+def error_log_path() -> Path:
+    return app_data_dir() / "last_error.log"
+
+
+def write_error_log(title: str, exc: BaseException, extra: str = ""):
+    try:
+        text = [
+            f"{APP_NAME} {APP_VERSION}",
+            title,
+            "",
+            f"{exc.__class__.__name__}: {exc}",
+            "",
+            traceback.format_exc(),
+        ]
+        if extra:
+            text.extend(["", extra])
+        error_log_path().write_text("\n".join(text), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def load_settings() -> dict:
@@ -66,9 +99,11 @@ def normalize_url(raw: str) -> str:
         raise ValueError("請貼上 Instagram 連結")
     if not re.match(r"^https?://", raw, re.I):
         raw = "https://" + raw
+
     host = urlparse(raw).netloc.lower().split(":")[0]
     if host.startswith("www."):
         host = host[4:]
+
     if host != "instagram.com" and not host.endswith(".instagram.com"):
         raise ValueError("目前只接受 instagram.com 連結")
     return raw
@@ -78,24 +113,40 @@ def target_info(url: str):
     parts = [x for x in urlparse(url).path.split("/") if x]
     if not parts:
         return "unknown", ""
-    if parts[0].lower() in {"p", "reel", "tv"}:
+
+    first = parts[0].lower()
+    if first in {"p", "reel", "tv"}:
         return "post", parts[1] if len(parts) > 1 else ""
+
     reserved = {
         "reels", "stories", "explore", "accounts", "direct",
         "about", "developer", "legal",
     }
-    if parts[0].lower() not in reserved:
+    if first not in reserved:
         return "profile", parts[0]
     return "unknown", ""
 
 
-def is_cdn(url: str) -> bool:
-    low = (url or "").lower()
+def is_media_url(url: str) -> bool:
+    host = urlparse(url or "").netloc.lower()
     return (
-        "cdninstagram.com" in low
-        or "fbcdn.net" in low
-        or "scontent-" in low
+        "cdninstagram.com" in host
+        or "fbcdn.net" in host
+        or host.startswith("scontent-")
+        or host.endswith(".cdninstagram.com")
+        or bool(re.match(r"^s\d+\.(?:imginn|imginncdn)\.com$", host))
+        or host.endswith(".imginn.com")
+        or host.endswith(".imginncdn.com")
     )
+
+
+def is_cdn(url: str) -> bool:
+    return is_media_url(url)
+
+
+def strip_query(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
 def ext_for(content_type: str, url: str) -> str:
@@ -107,14 +158,18 @@ def ext_for(content_type: str, url: str) -> str:
         "image/webp": ".webp",
         "image/gif": ".gif",
         "image/avif": ".avif",
+        "image/heic": ".heic",
         "video/mp4": ".mp4",
         "video/webm": ".webm",
         "video/quicktime": ".mov",
     }
     if ctype in known:
         return known[ctype]
+
     suffix = Path(unquote(urlparse(url).path)).suffix.lower()
-    return suffix if 1 < len(suffix) <= 6 else (mimetypes.guess_extension(ctype) or ".bin")
+    if suffix and 1 < len(suffix) <= 6:
+        return suffix
+    return mimetypes.guess_extension(ctype) or ".bin"
 
 
 def kind_for(content_type: str, url: str, hint: str = "") -> str:
@@ -123,12 +178,27 @@ def kind_for(content_type: str, url: str, hint: str = "") -> str:
         return "image"
     if ctype.startswith("video/"):
         return "video"
+
     ext = ext_for(content_type, url).lower().lstrip(".")
     if ext in IMAGE_EXTS:
         return "image"
     if ext in VIDEO_EXTS:
         return "video"
     return hint if hint in {"image", "video"} else "media"
+
+
+def is_target_closed_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    needles = (
+        "target page, context or browser has been closed",
+        "page has been closed",
+        "context has been closed",
+        "browser has been closed",
+        "browser closed",
+        "target closed",
+        "connection closed while reading from the driver",
+    )
+    return any(x in text for x in needles)
 
 
 def collect_post_links(page):
@@ -138,43 +208,90 @@ def collect_post_links(page):
     )
     out, seen = [], set()
     for href in hrefs:
-        p = urlparse(href)
-        if p.netloc.lower().endswith("imginn.com") and re.match(r"^/p/[^/]+/?$", p.path):
-            link = "https://imginn.com" + p.path.rstrip("/") + "/"
+        try:
+            parsed = urlparse(href)
+        except Exception:
+            continue
+        if (
+            parsed.netloc.lower().endswith("imginn.com")
+            and re.match(r"^/p/[^/]+/?$", parsed.path)
+        ):
+            link = "https://imginn.com" + parsed.path.rstrip("/") + "/"
             if link not in seen:
                 seen.add(link)
                 out.append(link)
     return out
 
 
+def force_lazy_media(page):
+    try:
+        page.evaluate(
+            """async () => {
+              for (const img of document.querySelectorAll('img')) {
+                try { img.loading = 'eager'; } catch (_) {}
+              }
+              for (const v of document.querySelectorAll('video')) {
+                try { v.preload = 'auto'; v.load(); } catch (_) {}
+              }
+              const maxY = Math.max(
+                document.body.scrollHeight || 0,
+                document.documentElement.scrollHeight || 0
+              );
+              const step = Math.max(500, Math.floor(window.innerHeight * 0.85));
+              for (let y = 0; y < maxY; y += step) {
+                window.scrollTo(0, y);
+                await new Promise(r => setTimeout(r, 45));
+              }
+              window.scrollTo(0, 0);
+            }"""
+        )
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def collect_media(page):
     rows = page.evaluate(
         """() => {
-          const out=[];
+          const out = [];
           for (const a of document.querySelectorAll('a[href]')) {
-            const t=(a.innerText||a.textContent||'').trim().toLowerCase();
-            if (t.includes('download')) out.push({url:a.href,kind:'media'});
+            const text = (a.innerText || a.textContent || '').trim().toLowerCase();
+            if (text === 'download' || text.includes('download')) {
+              out.push({url: a.href || '', kind: 'media'});
+            }
           }
           for (const img of document.querySelectorAll('img')) {
-            const u=img.currentSrc||img.src||'';
-            if (u && ((img.naturalWidth||0)>=500 || (img.naturalHeight||0)>=500))
-              out.push({url:u,kind:'image'});
+            const url = img.currentSrc || img.src || '';
+            const w = img.naturalWidth || 0;
+            const h = img.naturalHeight || 0;
+            if (url && (w >= 480 || h >= 480)) {
+              out.push({url, kind: 'image', w, h});
+            }
           }
-          for (const v of document.querySelectorAll('video')) {
-            const u=v.currentSrc||v.src||'';
-            if(u) out.push({url:u,kind:'video'});
-            for(const s of v.querySelectorAll('source'))
-              if(s.src) out.push({url:s.src,kind:'video'});
+          for (const video of document.querySelectorAll('video')) {
+            const url = video.currentSrc || video.src || '';
+            if (url) out.push({url, kind: 'video'});
+            for (const source of video.querySelectorAll('source')) {
+              if (source.src) out.push({url: source.src, kind: 'video'});
+            }
+          }
+          for (const source of document.querySelectorAll('source')) {
+            if (source.src) out.push({url: source.src, kind: 'video'});
           }
           return out;
         }"""
     )
+
     out, seen = [], set()
     for row in rows:
-        u = row.get("url", "")
-        if is_cdn(u) and u not in seen:
-            seen.add(u)
-            out.append({"url": u, "kind": row.get("kind", "media")})
+        url = row.get("url", "")
+        if not url or not is_media_url(url):
+            continue
+        key = strip_query(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"url": url, "kind": row.get("kind", "media")})
     return out
 
 
@@ -187,11 +304,13 @@ def verification_page(page) -> bool:
         ).lower()
     except Exception:
         return False
+
     return any(
-        x in text
-        for x in (
+        token in text
+        for token in (
             "verify you are human",
             "security verification",
+            "performing security verification",
             "just a moment",
             "captcha",
         )
@@ -202,40 +321,115 @@ def expand_profile(page, status, label):
     stagnant = 0
     for _ in range(500):
         before = len(collect_post_links(page))
-        status(f"{label}：目前找到 {before} 篇")
+        status(f"{label}：目前找到 {before} 篇，繼續載入…")
+
         buttons = page.get_by_role(
             "button",
             name=re.compile(r"^\s*More\s*$", re.I),
         )
         if buttons.count() == 0:
             break
+
         try:
-            b = buttons.last
-            if not b.is_visible():
+            button = buttons.last
+            if not button.is_visible():
                 break
-            b.scroll_into_view_if_needed(timeout=5000)
-            b.click(timeout=10000)
-            page.wait_for_timeout(1000)
-        except Exception:
+            button.scroll_into_view_if_needed(timeout=5000)
+            button.click(timeout=10000)
+            page.wait_for_timeout(900)
+        except Exception as exc:
+            if is_target_closed_error(exc):
+                raise
             break
+
         after = len(collect_post_links(page))
         stagnant = stagnant + 1 if after <= before else 0
         if stagnant >= 3:
             break
+
     return collect_post_links(page)
 
 
-def save_response_bytes(data: bytes, content_type: str, url: str, cache_dir: Path, index: int) -> tuple[Path, str]:
-    kind = kind_for(content_type, url)
-    if kind not in {"image", "video"}:
+def save_response_bytes(
+    data: bytes,
+    content_type: str,
+    url: str,
+    cache_dir: Path,
+    index: int,
+    hint: str = "",
+) -> tuple[Path, str]:
+    real_kind = kind_for(content_type, url, hint)
+    if real_kind not in {"image", "video"}:
         raise RuntimeError("不是可辨識的照片或影片")
+    if len(data) < 64:
+        raise RuntimeError("媒體資料太小，可能不是有效檔案")
+
     ext = ext_for(content_type, url)
     path = cache_dir / f"{index:05d}{ext}"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
-    return path, kind
+    return path, real_kind
 
 
-def cache_with_browser(page, media_url: str, post_url: str, cache_dir: Path, index: int, hint: str):
+def install_response_capture(page, store: dict):
+    def on_response(response):
+        try:
+            content_type = response.headers.get("content-type", "")
+            kind = kind_for(content_type, response.url)
+            if kind not in {"image", "video"}:
+                return
+            if not is_media_url(response.url):
+                return
+            store[response.url] = (response, content_type)
+            store[strip_query(response.url)] = (response, content_type)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+
+
+def response_bytes_for_url(captured: dict, media_url: str):
+    pair = captured.get(media_url) or captured.get(strip_query(media_url))
+    if not pair:
+        return None
+
+    response, content_type = pair
+    try:
+        data = response.body()
+        if data:
+            return data, content_type
+    except Exception:
+        return None
+    return None
+
+
+def cache_media_item(
+    page,
+    captured: dict,
+    media_url: str,
+    post_url: str,
+    cache_dir: Path,
+    index: int,
+    hint: str,
+):
+    captured_data = response_bytes_for_url(captured, media_url)
+    if captured_data:
+        data, content_type = captured_data
+        path, real_kind = save_response_bytes(
+            data,
+            content_type,
+            media_url,
+            cache_dir,
+            index,
+            hint,
+        )
+        return {
+            "url": media_url,
+            "kind": real_kind,
+            "local_path": str(path),
+            "post_url": post_url,
+        }
+
     try:
         response = page.context.request.get(
             media_url,
@@ -250,135 +444,243 @@ def cache_with_browser(page, media_url: str, post_url: str, cache_dir: Path, ind
             content_type = response.headers.get("content-type", "")
             data = response.body()
             path, real_kind = save_response_bytes(
-                data, content_type, media_url, cache_dir, index
+                data,
+                content_type,
+                media_url,
+                cache_dir,
+                index,
+                hint,
             )
             return {
                 "url": media_url,
-                "kind": real_kind if real_kind != "media" else hint,
+                "kind": real_kind,
                 "local_path": str(path),
                 "post_url": post_url,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        if is_target_closed_error(exc):
+            raise
 
     response = requests.get(
         media_url,
         headers={
             "User-Agent": BROWSER_UA,
-            "Referer": post_url,
+            "Referer": "https://imginn.com/",
             "Accept": "image/avif,image/webp,image/apng,image/*,video/*,*/*;q=0.8",
         },
         timeout=90,
         allow_redirects=True,
     )
     response.raise_for_status()
-    if "text/html" in response.headers.get("Content-Type", "").lower():
+
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type.lower():
         raise RuntimeError("媒體網址回傳 HTML")
+
     path, real_kind = save_response_bytes(
         response.content,
-        response.headers.get("Content-Type", ""),
+        content_type,
         media_url,
         cache_dir,
         index,
+        hint,
     )
     return {
         "url": media_url,
-        "kind": real_kind if real_kind != "media" else hint,
+        "kind": real_kind,
         "local_path": str(path),
         "post_url": post_url,
     }
 
 
-def scrape_public_profile(username: str, status, cache_dir: Path):
+def _launch_playwright_browser(p, engine: str):
+    common = {
+        "headless": True,
+        "args": ["--disable-gpu", "--disable-dev-shm-usage"],
+    }
+
+    if engine == "bundled":
+        return p.chromium.launch(**common)
+    if engine == "msedge":
+        return p.chromium.launch(channel="msedge", **common)
+    if engine == "chrome":
+        return p.chromium.launch(channel="chrome", **common)
+    raise ValueError(engine)
+
+
+def _scrape_profile_once(
+    p,
+    engine: str,
+    username: str,
+    status,
+    cache_dir: Path,
+    attempt_no: int,
+):
     browser = None
+    context = None
     try:
-        with sync_playwright() as p:
-            errors = []
-            for channel in ("msedge", "chrome"):
-                try:
-                    browser = p.chromium.launch(channel=channel, headless=False)
-                    break
-                except Exception as exc:
-                    errors.append(f"{channel}: {exc}")
-            if browser is None:
-                raise RuntimeError("無法啟動 Edge / Chrome\n" + "\n".join(errors))
+        engine_name = "內建 Chromium" if engine == "bundled" else engine
+        status(f"公開備援：使用 {engine_name} 解析 @{username}…")
 
-            page = browser.new_page(viewport={"width": 1280, "height": 900})
-            page.set_default_timeout(15000)
+        browser = _launch_playwright_browser(p, engine)
+        if not browser.is_connected():
+            raise RuntimeError("瀏覽器啟動後立即中斷")
 
-            posts, seen_posts = [], set()
-            for label, url in (
-                ("Posts", f"https://imginn.com/{username}/"),
-                ("Reels", f"https://imginn.com/reels/{username}/"),
-            ):
-                status(f"公開備援：讀取 {label}…")
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(900)
-                except Exception:
-                    if label == "Posts":
-                        raise
-                    continue
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            viewport={"width": 1365, "height": 900},
+            locale="en-US",
+        )
+        page = context.new_page()
+        page.set_default_timeout(20000)
+        page.set_default_navigation_timeout(60000)
+
+        posts, seen_posts = [], set()
+        for label, profile_url in (
+            ("Posts", f"https://imginn.com/{username}/"),
+            ("Reels", f"https://imginn.com/reels/{username}/"),
+        ):
+            status(f"公開備援：讀取 {label}…")
+            try:
+                page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(900)
+            except Exception as exc:
+                if label == "Posts":
+                    raise
+                if is_target_closed_error(exc):
+                    raise
+                continue
+
+            if verification_page(page):
+                raise VerificationRequired(
+                    "公開備援網站顯示驗證頁，程式已停止。"
+                    "本程式不會破解 CAPTCHA 或規避網站存取限制。"
+                )
+
+            for link in expand_profile(page, status, label):
+                if link not in seen_posts:
+                    seen_posts.add(link)
+                    posts.append(link)
+
+        if not posts:
+            raise RuntimeError(f"公開帳號 @{username} 沒有取得貼文連結")
+
+        status(f"共找到 {len(posts)} 篇，開始逐篇建立高清預覽…")
+
+        media = []
+        seen_media = set()
+        saved_index = 0
+        attempt_dir = cache_dir / f"attempt_{attempt_no}_{engine}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        for post_i, post_url in enumerate(posts, 1):
+            status(
+                f"解析貼文 {post_i} / {len(posts)} · 已快取 {saved_index} 個媒體"
+            )
+
+            captured = {}
+            install_response_capture(page, captured)
+
+            try:
+                page.goto(post_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(450)
+                force_lazy_media(page)
 
                 if verification_page(page):
-                    raise RuntimeError(
-                        "公開備援網站顯示驗證頁，程式已停止；"
-                        "不會破解 CAPTCHA 或規避網站驗證。"
-                    )
+                    raise VerificationRequired("公開備援網站顯示驗證頁，程式已停止。")
 
-                for link in expand_profile(page, status, label):
-                    if link not in seen_posts:
-                        seen_posts.add(link)
-                        posts.append(link)
+                for raw in collect_media(page):
+                    media_url = raw["url"]
+                    media_key = strip_query(media_url)
+                    if media_key in seen_media:
+                        continue
 
-            if not posts:
-                raise RuntimeError(f"公開帳號 @{username} 沒有取得貼文連結")
+                    try:
+                        item = cache_media_item(
+                            page,
+                            captured,
+                            media_url,
+                            post_url,
+                            attempt_dir,
+                            saved_index + 1,
+                            raw.get("kind", "media"),
+                        )
+                    except Exception as exc:
+                        if is_target_closed_error(exc):
+                            raise
+                        continue
 
-            status(f"共找到 {len(posts)} 篇，開始逐篇解析並建立高清預覽…")
-            media, seen_urls = [], set()
-            saved_index = 0
+                    seen_media.add(media_key)
+                    saved_index += 1
+                    media.append(item)
 
-            for post_i, post in enumerate(posts, 1):
-                status(f"解析貼文 {post_i} / {len(posts)} · 建立高清預覽")
-                try:
-                    page.goto(post, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(450)
-
-                    if verification_page(page):
-                        raise RuntimeError("公開備援網站顯示驗證頁，程式已停止。")
-
-                    for raw in collect_media(page):
-                        media_url = raw["url"]
-                        if media_url in seen_urls:
-                            continue
-                        seen_urls.add(media_url)
-
-                        try:
-                            saved_index += 1
-                            item = cache_with_browser(
-                                page,
-                                media_url,
-                                post,
-                                cache_dir,
-                                saved_index,
-                                raw.get("kind", "media"),
-                            )
-                            media.append(item)
-                        except Exception:
-                            saved_index -= 1
-                            continue
-                except RuntimeError:
+            except VerificationRequired:
+                raise
+            except Exception as exc:
+                if is_target_closed_error(exc):
                     raise
-                except Exception:
-                    continue
+                continue
 
-            return media
+        if not media:
+            raise RuntimeError(
+                f"公開帳號 @{username} 找到 {len(posts)} 篇貼文，"
+                "但沒有取得可用的高清照片或影片。"
+            )
+
+        return media
     finally:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
         if browser:
             try:
                 browser.close()
             except Exception:
                 pass
+
+
+def scrape_public_profile(username: str, status, cache_dir: Path):
+    attempt_errors = []
+
+    with sync_playwright() as p:
+        attempt_no = 0
+        for engine in ("bundled", "msedge", "chrome"):
+            for retry_no in range(1, 3):
+                attempt_no += 1
+                try:
+                    return _scrape_profile_once(
+                        p,
+                        engine,
+                        username,
+                        status,
+                        cache_dir,
+                        attempt_no,
+                    )
+                except VerificationRequired:
+                    raise
+                except Exception as exc:
+                    attempt_errors.append(
+                        f"{engine} attempt {retry_no}: {exc.__class__.__name__}: {exc}"
+                    )
+
+                    if is_target_closed_error(exc):
+                        status(
+                            "公開備援瀏覽器意外關閉，"
+                            f"正在自動重啟（{engine} {retry_no}/2）…"
+                        )
+                    else:
+                        status(
+                            f"公開備援 {engine} 第 {retry_no} 次失敗，"
+                            "正在嘗試下一個引擎…"
+                        )
+
+    raise RuntimeError(
+        "公開備援無法完成解析。已自動嘗試內建 Chromium、"
+        "Microsoft Edge 與 Google Chrome。\n\n"
+        + "\n".join(attempt_errors[-6:])
+    )
 
 
 def cache_direct_item(item: dict, cache_dir: Path, index: int):
@@ -394,22 +696,36 @@ def cache_direct_item(item: dict, cache_dir: Path, index: int):
         allow_redirects=True,
     )
     response.raise_for_status()
-    if "text/html" in response.headers.get("Content-Type", "").lower():
+
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type.lower():
         return item
-    kind = kind_for(
-        response.headers.get("Content-Type", ""),
-        url,
-        item.get("kind", ""),
-    )
+
+    kind = kind_for(content_type, url, item.get("kind", ""))
     if kind not in {"image", "video"}:
         return item
-    ext = ext_for(response.headers.get("Content-Type", ""), url)
+
+    ext = ext_for(content_type, url)
     path = cache_dir / f"{index:05d}{ext}"
     path.write_bytes(response.content)
+
     item = dict(item)
     item["kind"] = kind
     item["local_path"] = str(path)
     return item
+
+
+def playwright_self_test():
+    with sync_playwright() as p:
+        browser = _launch_playwright_browser(p, "bundled")
+        try:
+            page = browser.new_page()
+            page.set_content("<html><body><h1 id='ok'>ready</h1></body></html>")
+            text = page.locator("#ok").inner_text(timeout=5000)
+            if text != "ready":
+                raise RuntimeError("Playwright self-test DOM mismatch")
+        finally:
+            browser.close()
 
 
 class App(ctk.CTk):
@@ -420,15 +736,14 @@ class App(ctk.CTk):
 
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1120x820")
-        self.minsize(900, 680)
+        self.geometry("1180x860")
+        self.minsize(940, 700)
 
         self.media = []
         self.backend = ""
         self.username = ""
         self.busy = False
         self.thumb_refs = []
-        self.preview_window = None
         self.cache_dir = Path(tempfile.mkdtemp(prefix="ig_media_downloader_"))
 
         self._ui()
@@ -447,6 +762,7 @@ class App(ctk.CTk):
             text="Instagram 媒體下載器",
             font=ctk.CTkFont(size=28, weight="bold"),
         ).grid(row=0, column=0, sticky="w")
+
         ctk.CTkLabel(
             top,
             text="公開帳號免登入 · 高清預覽 · Post / Reel / Carousel / Profile",
@@ -480,9 +796,9 @@ class App(ctk.CTk):
         self.url.grid(row=1, column=0, padx=(18, 8), pady=(0, 16), sticky="ew")
         self.url.bind("<Return>", lambda _e: self.analyze())
 
-        ctk.CTkButton(card, text="貼上", width=90, height=44, command=self.paste).grid(
-            row=1, column=1, padx=4, pady=(0, 16)
-        )
+        ctk.CTkButton(
+            card, text="貼上", width=90, height=44, command=self.paste
+        ).grid(row=1, column=1, padx=4, pady=(0, 16))
 
         self.analyze_btn = ctk.CTkButton(
             card, text="解析整頁", width=120, height=44, command=self.analyze
@@ -493,17 +809,17 @@ class App(ctk.CTk):
         options.grid(row=2, column=0, padx=28, pady=8, sticky="ew")
         options.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(options, text="下載到", font=ctk.CTkFont(weight="bold")).grid(
-            row=0, column=0, padx=(18, 10), pady=(16, 8)
-        )
+        ctk.CTkLabel(
+            options, text="下載到", font=ctk.CTkFont(weight="bold")
+        ).grid(row=0, column=0, padx=(18, 10), pady=(16, 8))
 
         self.folder = ctk.CTkEntry(options, height=38)
         self.folder.insert(0, self.cfg["folder"])
         self.folder.grid(row=0, column=1, pady=(16, 8), sticky="ew")
 
-        ctk.CTkButton(options, text="選擇資料夾", width=110, command=self.choose_folder).grid(
-            row=0, column=2, padx=(10, 18), pady=(16, 8)
-        )
+        ctk.CTkButton(
+            options, text="選擇資料夾", width=110, command=self.choose_folder
+        ).grid(row=0, column=2, padx=(10, 18), pady=(16, 8))
 
         ctk.CTkLabel(
             options,
@@ -569,13 +885,13 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             bottom,
-            text="解析時先快取可下載媒體，避免按「全部下載」後 CDN 網址過期。",
+            text="解析時直接快取瀏覽器已載入的原始媒體，避免短效 CDN 網址稍後回傳 403。",
             text_color=("gray40", "gray65"),
         ).grid(row=0, column=0, sticky="w")
 
-        ctk.CTkButton(bottom, text="開啟資料夾", width=110, command=self.open_folder).grid(
-            row=0, column=1, padx=8
-        )
+        ctk.CTkButton(
+            bottom, text="開啟資料夾", width=110, command=self.open_folder
+        ).grid(row=0, column=1, padx=8)
 
         self.download_btn = ctk.CTkButton(
             bottom, text="全部下載", width=140, command=self.download, state="disabled"
@@ -587,9 +903,9 @@ class App(ctk.CTk):
     def _on_preview_mousewheel(self, event):
         try:
             direction = -1 if event.delta > 0 else 1
-            for step in range(1, 6):
+            for step in range(1, 7):
                 self.after(
-                    step * 10,
+                    step * 9,
                     lambda d=direction: self.preview._parent_canvas.yview_scroll(d, "units"),
                 )
             return "break"
@@ -630,11 +946,11 @@ class App(ctk.CTk):
             pass
 
     def choose_folder(self):
-        p = filedialog.askdirectory(initialdir=self.folder.get() or str(Path.home()))
-        if p:
+        path = filedialog.askdirectory(initialdir=self.folder.get() or str(Path.home()))
+        if path:
             self.folder.delete(0, "end")
-            self.folder.insert(0, p)
-            self.cfg["folder"] = p
+            self.folder.insert(0, path)
+            self.cfg["folder"] = path
             save_settings(self.cfg)
 
     def set_busy(self, value):
@@ -645,7 +961,7 @@ class App(ctk.CTk):
         )
 
     def set_status(self, text):
-        self.after(0, lambda t=text: self.status.configure(text=t[:180]))
+        self.after(0, lambda t=text: self.status.configure(text=t[:190]))
 
     def gallery_config(self):
         out = Path(self.folder.get().strip()).expanduser()
@@ -664,6 +980,7 @@ class App(ctk.CTk):
     def analyze(self):
         if self.busy:
             return
+
         try:
             url = normalize_url(self.url.get())
             self.gallery_config()
@@ -679,8 +996,10 @@ class App(ctk.CTk):
 
         self.progress.set(0)
         self.summary.configure(text="正在解析整頁…")
-        self.status.configure(text="先解析，再建立高清預覽快取…")
-        self._show_preview_message("正在解析，請稍候…")
+        self.status.configure(
+            text="先嘗試 Instagram 直連；公開 Profile 無結果時自動切換內建 Chromium。"
+        )
+        self._show_preview_message("正在解析並建立高清預覽，請稍候…")
         self.set_busy(True)
 
         threading.Thread(target=self._analyze_worker, args=(url,), daemon=True).start()
@@ -689,23 +1008,23 @@ class App(ctk.CTk):
         direct_error = None
 
         try:
-            d = job.DataJob(url, file=None, resolve=True)
-            d.run()
-            if d.exception:
-                raise d.exception
+            data_job = job.DataJob(url, file=None, resolve=True)
+            data_job.run()
+            if data_job.exception:
+                raise data_job.exception
 
             out, seen = [], set()
-            for i, u in enumerate(d.data_urls):
-                meta = d.data_meta[i] if i < len(d.data_meta) else {}
+            for index, media_url in enumerate(data_job.data_urls):
+                meta = data_job.data_meta[index] if index < len(data_job.data_meta) else {}
                 ext = (
                     str(meta.get("extension") or "").lower().lstrip(".")
-                    or Path(urlparse(u).path).suffix.lower().lstrip(".")
+                    or Path(urlparse(media_url).path).suffix.lower().lstrip(".")
                 )
-                if ext in IMAGE_EXTS | VIDEO_EXTS and u not in seen:
-                    seen.add(u)
+                if ext in IMAGE_EXTS | VIDEO_EXTS and media_url not in seen:
+                    seen.add(media_url)
                     out.append(
                         {
-                            "url": u,
+                            "url": media_url,
                             "kind": "video" if ext in VIDEO_EXTS else "image",
                             "meta": meta,
                         }
@@ -713,35 +1032,32 @@ class App(ctk.CTk):
 
             if out:
                 self.set_status(
-                    f"Instagram 直連解析到 {len(out)} 個媒體，建立預覽快取…"
+                    f"Instagram 直連解析到 {len(out)} 個媒體，正在建立高清預覽快取…"
                 )
                 cached = []
-                for i, item in enumerate(out, 1):
+                for index, item in enumerate(out, 1):
                     try:
-                        cached.append(cache_direct_item(item, self.cache_dir, i))
+                        cached.append(cache_direct_item(item, self.cache_dir, index))
                     except Exception:
                         cached.append(item)
                     self.after(
                         0,
-                        lambda n=i, t=len(out): self.progress.set(n / max(1, t)),
+                        lambda n=index, t=len(out): self.progress.set(n / max(1, t)),
                     )
 
                 self.backend = "gallery"
                 self.media = cached
                 self.after(0, self._analyze_done)
                 return
+
         except Exception as exc:
             direct_error = exc
 
         kind, username = target_info(url)
         if kind != "profile" or not username:
-            self.after(
-                0,
-                lambda: self.fail(
-                    "解析失敗",
-                    direct_error or RuntimeError("沒有解析到媒體"),
-                ),
-            )
+            exc = direct_error or RuntimeError("沒有解析到媒體")
+            write_error_log("Instagram direct parse failed", exc, f"url={url}")
+            self.after(0, lambda e=exc: self.fail("解析失敗", e))
             return
 
         try:
@@ -754,12 +1070,17 @@ class App(ctk.CTk):
             self.backend = "imginn"
             self.after(0, self._analyze_done)
         except Exception as exc:
+            write_error_log(
+                "Public profile fallback failed",
+                exc,
+                f"url={url}\ndirect_error={direct_error}",
+            )
             self.after(0, lambda e=exc: self.fail("解析失敗", e))
 
     def _analyze_done(self):
-        images = sum(x.get("kind") == "image" for x in self.media)
-        videos = sum(x.get("kind") == "video" for x in self.media)
-        cached = sum(bool(x.get("local_path")) for x in self.media)
+        images = sum(item.get("kind") == "image" for item in self.media)
+        videos = sum(item.get("kind") == "video" for item in self.media)
+        cached = sum(bool(item.get("local_path")) for item in self.media)
 
         self.summary.configure(text=f"已解析 {len(self.media)} 個媒體")
         self.status.configure(
@@ -782,8 +1103,8 @@ class App(ctk.CTk):
 
     def _render_preview_batch(self, start):
         end = min(start + 6, len(self.media))
-        for i in range(start, end):
-            self._make_preview_card(i, self.media[i])
+        for index in range(start, end):
+            self._make_preview_card(index, self.media[index])
         if end < len(self.media):
             self.after(15, lambda e=end: self._render_preview_batch(e))
 
@@ -801,32 +1122,32 @@ class App(ctk.CTk):
         if kind == "image" and local_path and Path(local_path).exists():
             try:
                 with Image.open(local_path) as original:
-                    img = ImageOps.exif_transpose(original).convert("RGB")
-                    img.thumbnail((300, 300), Image.Resampling.LANCZOS)
-                    display = img.copy()
+                    image = ImageOps.exif_transpose(original).convert("RGB")
+                    image.thumbnail((320, 320), Image.Resampling.LANCZOS)
+                    display = image.copy()
 
-                ctk_img = ctk.CTkImage(
+                ctk_image = ctk.CTkImage(
                     light_image=display,
                     dark_image=display,
                     size=display.size,
                 )
-                self.thumb_refs.append(ctk_img)
+                self.thumb_refs.append(ctk_image)
 
                 button = ctk.CTkButton(
                     card,
                     text="",
-                    image=ctk_img,
+                    image=ctk_image,
                     fg_color="transparent",
                     hover_color=("gray85", "gray22"),
                     command=lambda p=local_path, n=index + 1: self.open_image_preview(p, n),
                 )
                 button.grid(row=0, column=0, padx=8, pady=(8, 4), sticky="nsew")
             except Exception:
-                self._placeholder(card, "照片", index)
+                self._placeholder(card, "照片")
         elif kind == "video":
-            self._video_placeholder(card, local_path, index)
+            self._video_placeholder(card, local_path)
         else:
-            self._placeholder(card, "媒體", index)
+            self._placeholder(card, "媒體")
 
         ctk.CTkLabel(
             card,
@@ -834,34 +1155,26 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
         ).grid(row=1, column=0, padx=10, pady=(2, 10))
 
-    def _placeholder(self, card, text, index):
+    def _placeholder(self, card, text):
         ctk.CTkButton(
             card,
             text=f"{text}\n\n預覽暫不可用",
-            height=220,
+            height=230,
             fg_color=("gray82", "gray24"),
             hover=False,
             state="disabled",
         ).grid(row=0, column=0, padx=8, pady=(8, 4), sticky="nsew")
 
-    def _video_placeholder(self, card, local_path, index):
-        button = ctk.CTkButton(
+    def _video_placeholder(self, card, local_path):
+        exists = bool(local_path and Path(local_path).exists())
+        ctk.CTkButton(
             card,
             text="▶\n\n影片\n點擊播放",
-            height=220,
+            height=230,
             font=ctk.CTkFont(size=18, weight="bold"),
-            command=(
-                (lambda p=local_path: self.open_local_file(p))
-                if local_path and Path(local_path).exists()
-                else None
-            ),
-            state=(
-                "normal"
-                if local_path and Path(local_path).exists()
-                else "disabled"
-            ),
-        )
-        button.grid(row=0, column=0, padx=8, pady=(8, 4), sticky="nsew")
+            command=(lambda p=local_path: self.open_local_file(p)) if exists else None,
+            state="normal" if exists else "disabled",
+        ).grid(row=0, column=0, padx=8, pady=(8, 4), sticky="nsew")
 
     def open_image_preview(self, path, number):
         if not Path(path).exists():
@@ -873,28 +1186,27 @@ class App(ctk.CTk):
 
             screen_w = max(900, self.winfo_screenwidth())
             screen_h = max(700, self.winfo_screenheight())
-            max_w = min(1400, screen_w - 160)
-            max_h = min(900, screen_h - 180)
-
+            max_w = min(1500, screen_w - 120)
+            max_h = min(950, screen_h - 160)
             image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
 
             win = ctk.CTkToplevel(self)
             win.title(f"高清預覽 #{number:04d}")
             win.geometry(
-                f"{min(max_w + 60, screen_w - 80)}x{min(max_h + 100, screen_h - 100)}"
+                f"{min(max_w + 60, screen_w - 60)}x{min(max_h + 105, screen_h - 80)}"
             )
             win.transient(self)
 
-            img_ref = ctk.CTkImage(
+            image_ref = ctk.CTkImage(
                 light_image=image,
                 dark_image=image,
                 size=image.size,
             )
-            win._preview_image_ref = img_ref
+            win._preview_image_ref = image_ref
 
-            label = ctk.CTkLabel(win, text="", image=img_ref)
-            label.pack(expand=True, fill="both", padx=20, pady=(20, 8))
-
+            ctk.CTkLabel(win, text="", image=image_ref).pack(
+                expand=True, fill="both", padx=20, pady=(20, 8)
+            )
             ctk.CTkButton(
                 win,
                 text="用系統程式開啟原始檔",
@@ -922,7 +1234,6 @@ class App(ctk.CTk):
         self.progress.set(0)
         self.summary.configure(text="正在下載…")
         self.set_busy(True)
-
         threading.Thread(target=self._download_worker, args=(out,), daemon=True).start()
 
     def _download_worker(self, out):
@@ -934,48 +1245,48 @@ class App(ctk.CTk):
             ]
 
             if self.backend == "imginn":
-                if not local_items:
-                    raise RuntimeError("沒有有效的預覽快取可下載，請重新解析後再試。")
+                if len(local_items) != len(self.media):
+                    raise RuntimeError("部分高清快取不存在，請重新解析後再下載。")
                 self._copy_cached_items(out)
             else:
                 if len(local_items) == len(self.media):
                     self._copy_cached_items(out)
                 else:
-                    j = job.DownloadJob(normalize_url(self.url.get()))
-                    code = j.run()
+                    download_job = job.DownloadJob(normalize_url(self.url.get()))
+                    code = download_job.run()
                     if code:
                         raise RuntimeError(f"下載器回傳狀態碼 {code}")
 
             self.after(0, self.download_done)
         except Exception as exc:
+            write_error_log("Download failed", exc)
             self.after(0, lambda e=exc: self.fail("下載失敗", e))
 
     def _copy_cached_items(self, out: Path):
         total = len(self.media)
         prefix = self.username or "instagram"
 
-        for i, item in enumerate(self.media, 1):
+        for index, item in enumerate(self.media, 1):
             local = item.get("local_path")
             if not local or not Path(local).exists():
-                raise RuntimeError(f"第 {i} 個媒體的快取已失效，請重新解析。")
+                raise RuntimeError(f"第 {index} 個媒體的快取已失效，請重新解析。")
 
             source = Path(local)
-            destination = out / f"{prefix}_{i:05d}{source.suffix.lower()}"
+            destination = out / f"{prefix}_{index:05d}{source.suffix.lower()}"
 
             if destination.exists():
                 stem = destination.stem
                 suffix = destination.suffix
-                n = 2
+                number = 2
                 while destination.exists():
-                    destination = out / f"{stem}_{n}{suffix}"
-                    n += 1
+                    destination = out / f"{stem}_{number}{suffix}"
+                    number += 1
 
             shutil.copy2(source, destination)
-
-            self.set_status(f"下載 {i} / {total} · 複製高清快取")
+            self.set_status(f"下載 {index} / {total} · 複製高清快取")
             self.after(
                 0,
-                lambda n=i, t=total: self.progress.set(n / max(1, t)),
+                lambda n=index, t=total: self.progress.set(n / max(1, t)),
             )
 
     def download_done(self):
@@ -988,19 +1299,21 @@ class App(ctk.CTk):
     def fail(self, title, exc):
         text = str(exc).strip() or exc.__class__.__name__
         self.summary.configure(text=title)
-        self.status.configure(text=text.splitlines()[0][:180])
+        self.status.configure(text=text.splitlines()[0][:190])
         self.progress.set(0)
         self.set_busy(False)
-        messagebox.showerror(APP_NAME, text)
+
+        suffix = "\n\n已將完整錯誤記錄到：\n" + str(error_log_path())
+        messagebox.showerror(APP_NAME, text + suffix)
 
     def open_folder(self):
-        p = Path(self.folder.get()).expanduser()
-        p.mkdir(parents=True, exist_ok=True)
+        path = Path(self.folder.get()).expanduser()
+        path.mkdir(parents=True, exist_ok=True)
         try:
-            os.startfile(p)
+            os.startfile(path)
         except AttributeError:
             subprocess.Popen(
-                ["open" if sys.platform == "darwin" else "xdg-open", str(p)]
+                ["open" if sys.platform == "darwin" else "xdg-open", str(path)]
             )
 
     def on_close(self):
@@ -1011,5 +1324,18 @@ class App(ctk.CTk):
         self.destroy()
 
 
-if __name__ == "__main__":
+def _main():
+    if "--self-test" in sys.argv:
+        try:
+            playwright_self_test()
+            return 0
+        except Exception as exc:
+            write_error_log("Packaged Playwright self-test failed", exc)
+            return 1
+
     App().mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
