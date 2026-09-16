@@ -115,7 +115,7 @@ jobs:
       - name: Build portable folder
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path portable_spec | Out-Null
+          Remove-Item 'IG-Media-Downloader.spec' -ErrorAction SilentlyContinue
           python -m PyInstaller `
             --noconfirm `
             --clean `
@@ -127,7 +127,7 @@ jobs:
             --version-file version_info.txt `
             --distpath dist_portable `
             --workpath build_portable `
-            --specpath portable_spec `
+            --specpath . `
             --collect-all gallery_dl `
             --collect-all customtkinter `
             --collect-all playwright `
