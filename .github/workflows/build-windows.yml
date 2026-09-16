@@ -151,8 +151,17 @@ jobs:
       - name: Packaged EXE browser self-test
         shell: pwsh
         run: |
-          & '.\dist_single\IG-Media-Downloader.exe' --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Packaged browser self-test failed with exit code $LASTEXITCODE" }
+          $process = Start-Process -FilePath '.\dist_single\IG-Media-Downloader.exe' -ArgumentList '--self-test' -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            $log = Join-Path $env:APPDATA 'IG-Media-Downloader\last_error.log'
+            if (Test-Path $log) {
+              Write-Host '----- packaged self-test error log -----'
+              Get-Content $log
+              Write-Host '------------------------------------------'
+            }
+            throw "Packaged browser self-test failed with exit code $($process.ExitCode)"
+          }
+          Write-Host 'Packaged EXE browser self-test OK'
 
       - name: Verify outputs and create checksums
         shell: pwsh
