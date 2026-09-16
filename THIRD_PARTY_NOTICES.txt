@@ -1,0 +1,17 @@
+Third-party notices
+
+gallery-dl
+Repository: https://github.com/mikf/gallery-dl
+License: GPL-2.0
+
+CustomTkinter
+Repository: https://github.com/TomSchimansky/CustomTkinter
+License: MIT
+
+Playwright
+Repository: https://github.com/microsoft/playwright-python
+License: Apache-2.0
+
+PyInstaller
+Repository: https://github.com/pyinstaller/pyinstaller
+License: GPL-2.0 with bootloader exception; see upstream licensing terms.
