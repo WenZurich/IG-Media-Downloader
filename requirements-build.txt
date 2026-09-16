@@ -2,4 +2,5 @@ gallery-dl==1.32.12
 customtkinter>=5.2.2
 requests>=2.32.0
 playwright>=1.55.0
+pillow>=10.4.0
 pyinstaller>=6.10
