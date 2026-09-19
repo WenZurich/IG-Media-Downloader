@@ -36,7 +36,7 @@ jobs:
       - name: Build EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name "YouTube-MP4-Downloader" --collect-all imageio_ffmpeg --collect-all yt_dlp app.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name "YouTube-MP4-Downloader" --collect-all imageio_ffmpeg --collect-all yt_dlp --collect-all customtkinter app.py
 
       - name: Smoke test file exists
         shell: pwsh
