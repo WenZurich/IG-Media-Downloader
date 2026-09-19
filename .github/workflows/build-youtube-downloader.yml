@@ -1,0 +1,53 @@
+name: Build YouTube Downloader EXE
+
+on:
+  push:
+    branches:
+      - youtube-downloader
+    paths:
+      - "youtube_downloader/**"
+      - ".github/workflows/build-youtube-downloader.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: youtube_downloader
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name "YouTube-MP4-Downloader" --collect-all imageio_ffmpeg --collect-all yt_dlp app.py
+
+      - name: Smoke test file exists
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\YouTube-MP4-Downloader.exe")) { throw "EXE was not created" }
+          Get-Item "dist\YouTube-MP4-Downloader.exe" | Format-List Name,Length,FullName
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTube-MP4-Downloader-Windows
+          path: youtube_downloader/dist/YouTube-MP4-Downloader.exe
+          if-no-files-found: error
+          retention-days: 30
