@@ -166,7 +166,8 @@ class App(tk.Tk):
     def _download(self, url, out):
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+            if not os.path.isfile(ffmpeg_exe):
+                raise RuntimeError(f"內建 FFmpeg 找不到：{ffmpeg_exe}")
 
             ydl_opts = {
                 "format": self._format_selector(),
@@ -176,7 +177,7 @@ class App(tk.Tk):
                 "windowsfilenames": True,
                 "noplaylist": True,
                 "progress_hooks": [self._hook],
-                "ffmpeg_location": ffmpeg_dir,
+                "ffmpeg_location": ffmpeg_exe,
                 "retries": 10,
                 "fragment_retries": 10,
                 "continuedl": True,
